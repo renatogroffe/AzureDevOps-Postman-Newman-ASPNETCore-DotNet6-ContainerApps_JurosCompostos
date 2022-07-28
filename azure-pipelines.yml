@@ -1,0 +1,186 @@
+trigger:
+- main
+
+resources:
+- repo: self
+
+variables:
+  # Container registry service connection established during pipeline creation
+  dockerRegistryServiceConnection: 'ID CONNECTION'
+  imageRepository: 'apifinancas'
+  containerRegistry: 'registry.azurecr.io'
+  dockerfilePath: '$(Build.SourcesDirectory)/Dockerfile'
+  tag: '$(Build.BuildId)'
+
+  # Agent VM image name
+  vmImageName: 'ubuntu-latest'
+
+  # Variáveis execução testes
+  File_Log_Execucao_WebApp: 'log-execucao-restapi.log'
+  Path_Projeto: './APIFinancas'
+  Path_Tests: './Tests'
+  Executavel_Projeto: 'APIFinancas.dll'
+  Collection_Postman: 'CalculoJurosCompostos.postman_collection.json'
+  DataFile_Postman: 'data-tests.json'
+
+  # Variáveis com configurações de Deployment
+  ResourceGroup: 'TestesContainers'
+  DataCenter: 'eastus'
+  ContApps_Environment: 'groffe-environment-containerapps'
+  ContApps_Workspace: 'workspace-groffe-containerapps'
+  ContApps_Name: 'groffe-financas'
+  ContApps_Cpu: '0.5'
+  ContApps_Memory: '1.0Gi'
+  ContApps_MinReplicas: '3'
+  ContApps_MaxReplicas: '10'
+
+stages:
+- stage: Tests
+  displayName: Tests stage
+  jobs:
+  - job: Tests
+    displayName: Tests
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - script: |
+        dotnet --version
+        dotnet publish $(Path_Projeto) -c Release -o app
+        cd ./app
+        nohup dotnet $(Executavel_Projeto) > $(File_Log_Execucao_WebApp) 2>&1 &
+        echo 'Aguardando a inicialização da aplicação a ser testada...'
+        sleep 10s
+      displayName: Executar a aplicação a ser testada em background (nohup)
+      env:
+        ASPNETCORE_URLS: 'http://localhost:5000'
+    - script: |
+        cd $(Path_Tests)
+        newman run $(Collection_Postman) -d $(DataFile_Postman)
+      displayName: Executar testes da API REST com Newman
+      condition: always() 
+    - script: |
+        echo "** Versão Global do Newman **"
+        newman -v
+        npm install newman-reporter-htmlextra@1.22.10
+        npm install newman-reporter-junitfullreport@1.0.4
+      displayName:  Instalar packages newman-reporter-htmlextra e newman-reporter-junitfullreport
+      condition: always() 
+    - script: |
+        cd $(Path_Tests)
+        npx newman run $(Collection_Postman) -d $(DataFile_Postman) -r htmlextra,junitfullreport
+        cd ./newman
+        ls
+      displayName: Gerar resultados em HTML e XML dos testes da API REST com Newman
+      condition: always() 
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/newman/*.xml'
+        searchFolder: '$(Build.SourcesDirectory)'
+      displayName: Publicar sumário dos testes com base no XML gerado
+      condition: always()
+    - task: UploadPostmanHtmlReport@1
+      displayName: Publicar relatório em HTML com resultados dos testes da API REST com Newman
+      inputs:
+        cwd: '$(System.DefaultWorkingDirectory)/$(Path_Tests)'
+      condition: always() 
+    - script: |
+        cd ./app
+        cat $(File_Log_Execucao_WebApp)
+      displayName: Exibir log de execução da aplicação testada
+      condition: Always()
+
+- stage: Build
+  displayName: Build and push stage
+  dependsOn: Tests
+  jobs:
+  - job: Build
+    displayName: Build
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: Docker@2
+      displayName: Build e push no Azure Container Registry
+      inputs:
+        command: buildAndPush
+        repository: $(imageRepository)
+        dockerfile: $(dockerfilePath)
+        containerRegistry: $(dockerRegistryServiceConnection)
+        tags: |
+          $(tag)
+
+- stage: Deploy
+  displayName: Deploy stage
+  dependsOn: Build
+  jobs:
+  - job: Deploy
+    displayName: Deploy
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: AzureCLI@2
+      displayName: Deployment como um Azure Container App
+      inputs:
+        azureSubscription: 'Microsoft Azure Sponsorship(f3e7d90b-efba-4481-ac3d-d8df26b6235d)'
+        scriptType: 'pscore'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          $RESOURCE_GROUP="$(ResourceGroup)"
+          $LOCATION="$(DataCenter)"
+          $CONTAINERAPPS_ENVIRONMENT="$(ContApps_Environment)"
+          $CONTAINERAPPS_WORKSPACE="$(ContApps_Workspace)"
+          $CONTAINERAPP_RESOUCENAME="$(ContApps_Name)"
+          $CONTAINER_REGISTRY="$(containerRegistry)"
+          $IMAGE_REPOSITORY="$(imageRepository)"
+          $TAG_IMAGE="$(tag)"
+          $CPU="$(ContApps_Cpu)"
+          $MEMORY="$(ContApps_Memory)"
+          $MIN_REPLICAS="$(ContApps_MinReplicas)"
+          $MAX_REPLICAS="$(ContApps_MaxReplicas)"
+
+          az extension add --name containerapp --upgrade
+          az provider register --namespace Microsoft.App
+          echo "Instalacao da extensao do Azure Container Apps concluida..."
+
+          az group create `
+            --name $RESOURCE_GROUP `
+            --location $LOCATION
+          echo "Resource Group configurado..."
+
+          az monitor log-analytics workspace create `
+            --workspace-name $CONTAINERAPPS_WORKSPACE `
+            --resource-group $RESOURCE_GROUP `
+            --location $LOCATION
+          echo "Workspace do Log Analytics configurado..."
+
+          $WORKSPACE_INFO=(az monitor log-analytics workspace show `
+            --workspace-name $CONTAINERAPPS_WORKSPACE `
+            --resource-group $RESOURCE_GROUP) | ConvertFrom-Json
+
+          $WORKSPACE_KEYS=(az monitor log-analytics workspace get-shared-keys `
+            --resource-group $RESOURCE_GROUP `
+            --workspace-name $CONTAINERAPPS_WORKSPACE) | ConvertFrom-Json
+
+          az containerapp env create `
+            --name $CONTAINERAPPS_ENVIRONMENT `
+            --resource-group $RESOURCE_GROUP `
+            --location $LOCATION `
+            --logs-workspace-id $WORKSPACE_INFO.customerId `
+            --logs-workspace-key $WORKSPACE_KEYS.primarySharedKey
+          echo "Environment do Container App configurado..."
+
+          az acr login --name $CONTAINER_REGISTRY
+
+          az containerapp create --name $CONTAINERAPP_RESOUCENAME `
+            --resource-group $RESOURCE_GROUP `
+            --image ($CONTAINER_REGISTRY + "/" + $IMAGE_REPOSITORY + ":" + $TAG_IMAGE) `
+            --environment $CONTAINERAPPS_ENVIRONMENT `
+            --ingress 'external' `
+            --cpu $CPU `
+            --memory $MEMORY `
+            --min-replicas $MIN_REPLICAS `
+            --max-replicas $MAX_REPLICAS `
+            --target-port 80 `
+            --registry-server $CONTAINER_REGISTRY `
+            --query properties.configuration.ingress.fqdn
+          echo "Container App configurado..."
